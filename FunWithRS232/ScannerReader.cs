@@ -1,12 +1,13 @@
 ﻿using System;
 using System.Buffers;
 using System.Collections.Generic;
+using System.Collections.Specialized;
+using System.ComponentModel;
 using System.IO;
 using System.IO.Ports;
 using System.Linq;
 using System.Reactive.Linq;
 using System.Reactive.Subjects;
-using System.Text;
 using System.Threading.Tasks;
 
 namespace FunWithRS232
@@ -15,14 +16,16 @@ namespace FunWithRS232
     {
         public string PortName { get; set; }
         public int BaudRate { get; set; }
-        public Parity Parity { get; set; } 
+        public Parity Parity { get; set; }
         public int DataBits { get; set; }
         public StopBits StopBits { get; set; }
+        public char[] SuffixSeq { get; set; }
     }
 
     public class ScannerReader
     {
         private readonly ScannerOptions options;
+        private BehaviorSubject<string> subject;
 
         public ScannerReader(ScannerOptions options)
         {
@@ -31,27 +34,56 @@ namespace FunWithRS232
 
         private readonly List<char> globalBuffer = new List<char>(65536);
 
-        public IObservable<string> Barcodes { get; }
+        public IObservable<string> Barcodes => subject.Where(x => !string.IsNullOrEmpty(x)).AsObservable();
 
         public async Task ObserveScanner()
         {
             var port = new SerialPort(options.PortName, options.BaudRate, options.Parity, options.DataBits, options.StopBits);
             port.Open();
+            subject = new BehaviorSubject<string>(string.Empty);
 
             var stream = port.BaseStream;
-            using var sreader = new StreamReader(stream);
-            using var owner = MemoryPool<char>.Shared.Rent();
-            while (true)
+            var sreader = new StreamReader(stream);
+            try
             {
-                var buf = new char[4096];
+                while (port.IsOpen)
+                {
+                    var buf = new char[4096];
 
-                var readBytes = await sreader.ReadAsync(buf, 0, buf.Length);
-                globalBuffer.AddRange(buf.Take(readBytes));
-                Console.WriteLine($"Read {readBytes} bytes");
-                for (int i = 0; i < readBytes; ++i)
-                    Console.WriteLine($"{buf[i]}\t{((byte)buf[i]).ToString("X2")}");
-                Console.WriteLine($"now global buffer is {globalBuffer.Count} elements");
+                    var readBytes = await sreader.ReadAsync(buf, 0, buf.Length);
+                    globalBuffer.AddRange(buf.Take(readBytes));
+                    ProcessBuffer();
+                }
             }
+            catch (OperationCanceledException) { }        
+            subject.OnCompleted();
+        }
+
+        private void ProcessBuffer()
+        {
+            int chunkIdx = -1;
+            do
+            {
+                chunkIdx = SearchSuffix(globalBuffer, options.SuffixSeq);
+                if (chunkIdx > 0)
+                {
+                    var s = new string(globalBuffer.Take(chunkIdx - options.SuffixSeq.Length).ToArray());
+                    globalBuffer.RemoveRange(0, chunkIdx);
+                    subject.OnNext(s);
+                }
+            } while (chunkIdx > 0);
+        }
+
+        private static int SearchSuffix(IEnumerable<char> haystack, char[] needle)
+        {
+            var needleLen = needle.Length;
+            var limit = haystack.Count() - needleLen;
+            for (int i = 0; i <= limit; ++i)
+            {
+                if (haystack.Skip(i).Take(needleLen).SequenceEqual(needle))
+                    return i + needleLen;
+            }
+            return -1;
         }
     }
 }
